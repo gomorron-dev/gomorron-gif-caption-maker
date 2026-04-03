@@ -27,7 +27,7 @@ The tool is engineered with a robust Python stack designed for reliability and p
 ## Installation & Deployment
 
 ### Running from Source
-1.  Ensure Python 3.9+ is installed[cite: 4].
+1.  Ensure Python 3.9+ is installed.
 2.  Install the required dependencies:
     ```bash
     pip install PySide6 Pillow imageio-ffmpeg
