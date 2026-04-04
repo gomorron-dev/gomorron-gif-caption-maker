@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Gomorron Caption Maker — by Gomorronmannen 💜
-Dark, minimalistic, slick caption GIF tool.
+Dark, minimalistic, slick caption GIF / WebP tool.
 """
 
 import os
@@ -18,14 +18,15 @@ from PySide6.QtCore import (
 )
 from PySide6.QtGui import (
     QPixmap, QFont, QColor, QPalette, QIcon, QDragEnterEvent, QDropEvent,
-    QKeySequence, QShortcut, QImage, QPainter, QLinearGradient, QPen
+    QKeySequence, QShortcut, QImage, QPainter, QLinearGradient, QPen,
+    QMovie, QImageReader
 )
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QPushButton, QCheckBox, QComboBox,
     QFileDialog, QGroupBox, QScrollArea, QSizePolicy, QSpinBox,
     QFrame, QProgressBar, QMessageBox, QSplitter, QSlider,
-    QGraphicsOpacityEffect, QDialog
+    QGraphicsOpacityEffect, QDialog, QColorDialog
 )
 from PIL import Image, ImageDraw, ImageFont, ImageSequence
 
@@ -165,8 +166,12 @@ def draw_outlined(draw, x, y, text, font, thickness, fg, bg):
 
 
 def render_caption_box(image_width, text, font_size, padding, font_path, is_impact,
-                        outline, outline_thickness, uppercase,
+                        outline, outline_thickness, uppercase, align="center",
                         bg_color=(255, 255, 255), text_color=(0, 0, 0)):
+    """Render a caption strip and return it as an RGB Image.
+
+    align — 'left' | 'center' | 'right'  (controls horizontal text placement)
+    """
     if uppercase:
         text = text.upper()
     font = ImageFont.truetype(font_path, font_size)
@@ -184,7 +189,12 @@ def render_caption_box(image_width, text, font_size, padding, font_path, is_impa
     for line in lines:
         bbox = font.getbbox(line)
         text_w = bbox[2] - bbox[0]
-        x = (image_width - text_w) // 2
+        if align == "left":
+            x = padding
+        elif align == "right":
+            x = image_width - text_w - padding
+        else:  # center (default)
+            x = (image_width - text_w) // 2
         if outline:
             draw_outlined(draw, x, y, line, font, outline_thickness, text_color, bg_color)
         else:
@@ -193,10 +203,11 @@ def render_caption_box(image_width, text, font_size, padding, font_path, is_impa
     return box
 
 
-def composite_parts(parts):
+def composite_parts(parts, bg_color=(255, 255, 255)):
+    """Stack image parts vertically onto a canvas filled with bg_color."""
     total_h = sum(p.height for p in parts)
     w = parts[0].width
-    out = Image.new("RGB", (w, total_h), "white")
+    out = Image.new("RGB", (w, total_h), bg_color)
     y = 0
     for p in parts:
         out.paste(p, (0, y))
@@ -210,7 +221,13 @@ def hex_to_rgb(hex_str):
 
 
 def format_size(size_bytes):
-    mb = size_bytes / (1024 * 1024)
+    """Human-readable file size: B → KB → MB → GB."""
+    if size_bytes < 1024:
+        return f"{size_bytes} B"
+    kb = size_bytes / 1024
+    if kb < 1024:
+        return f"{kb:.1f} KB"
+    mb = kb / 1024
     if mb >= 1000:
         return f"{mb / 1024:.2f} GB"
     return f"{mb:.2f} MB"
@@ -220,17 +237,18 @@ def format_size(size_bytes):
 
 def get_ffmpeg():
     """
-    Returns path to ffmpeg exe.
+    Returns path to ffmpeg binary.
     Priority:
-      1. ffmpeg.exe sitting next to the app (manual override)
+      1. ffmpeg / ffmpeg.exe sitting next to the app (manual override)
       2. imageio-ffmpeg managed binary (auto-downloaded on first use)
       3. ffmpeg on system PATH
     Raises RuntimeError if nothing is found.
     """
     import shutil
 
-    # 1. Next to the exe / script
-    local = _BASE / "ffmpeg.exe"
+    # 1. Next to the exe / script — platform-aware filename
+    local_name = "ffmpeg.exe" if sys.platform == "win32" else "ffmpeg"
+    local = _BASE / local_name
     if local.is_file():
         return str(local)
 
@@ -252,20 +270,21 @@ def get_ffmpeg():
         "ffmpeg not found.\n\n"
         "Install imageio-ffmpeg so it can be downloaded automatically:\n"
         "  pip install imageio-ffmpeg\n\n"
-        "Or place ffmpeg.exe next to the app."
+        "Or place ffmpeg next to the app."
     )
 
 
 # ── Video to frames helper ────────────────────────────────────────────────────
 
 def extract_video_frames(video_path, max_frames=60):
-    """Extract frames from a video file using imageio-ffmpeg (auto-downloaded)."""
-    import subprocess, tempfile, shutil
+    """Extract up to max_frames from a video using ffmpeg (cross-platform)."""
+    import shutil
 
     ffmpeg = get_ffmpeg()
 
-    # Derive ffprobe path next to ffmpeg, fall back to PATH
-    ffprobe = str(Path(ffmpeg).parent / "ffprobe.exe")
+    # Derive ffprobe path next to ffmpeg — platform-aware extension
+    ffprobe_name = "ffprobe.exe" if sys.platform == "win32" else "ffprobe"
+    ffprobe = str(Path(ffmpeg).parent / ffprobe_name)
     if not os.path.isfile(ffprobe):
         ffprobe = shutil.which("ffprobe") or ffmpeg
 
@@ -314,7 +333,8 @@ def extract_video_frames(video_path, max_frames=60):
         duration_per_frame = int(1000 / max(1, out_fps))
         return frames, [duration_per_frame] * len(frames)
     except Exception:
-        shutil.rmtree(tmpdir, ignore_errors=True)
+        import shutil as _shutil
+        _shutil.rmtree(tmpdir, ignore_errors=True)
         raise
 
 
@@ -334,12 +354,16 @@ class Worker(QObject):
             p = self.params
             font_path, is_impact = find_font(p.get("font_custom"))
 
-            is_video = p.get("is_video", False)
+            is_video   = p.get("is_video", False)
             no_caption = p.get("no_caption", False)
+            out_fmt    = p.get("out_format", "GIF").upper()
+            max_frames = p.get("max_frames", 60)
 
             if is_video:
                 self.progress.emit(5)
-                src_frames_rgba, durations = extract_video_frames(p["input_path"])
+                src_frames_rgba, durations = extract_video_frames(
+                    p["input_path"], max_frames=max_frames
+                )
             else:
                 src = Image.open(p["input_path"])
                 src_frames_rgba, durations = [], []
@@ -353,7 +377,7 @@ class Worker(QObject):
                     src_frames_rgba = [src.convert("RGBA")]
                     durations = [100]
 
-            # Convert RGBA → RGB
+            # Convert RGBA → RGB (composite onto white background)
             rgb_frames = []
             for f in src_frames_rgba:
                 bg = Image.new("RGB", f.size, (255, 255, 255))
@@ -378,6 +402,7 @@ class Worker(QObject):
                 outline=p["outline"],
                 outline_thickness=p.get("outline_thickness", 2),
                 uppercase=p["uppercase"],
+                align=p.get("align", "center"),
                 bg_color=bg_color, text_color=text_color,
             )
 
@@ -412,17 +437,27 @@ class Worker(QObject):
                 if top_box: parts.append(top_box)
                 parts.append(sf)
                 if bot_box: parts.append(bot_box)
-                out_frames.append(composite_parts(parts))
+                # Pass bg_color so transparent pixels composite correctly
+                out_frames.append(composite_parts(parts, bg_color=bg_color))
 
             self.progress.emit(95)
-            out_frames[0].save(
-                p["output_path"], format="GIF", save_all=True,
-                append_images=out_frames[1:], loop=0,
-                duration=durations[:n], optimize=False,
-            )
+
+            if out_fmt == "WEBP":
+                out_frames[0].save(
+                    p["output_path"], format="WEBP", save_all=True,
+                    append_images=out_frames[1:], loop=0,
+                    duration=durations[:n],
+                )
+            else:
+                out_frames[0].save(
+                    p["output_path"], format="GIF", save_all=True,
+                    append_images=out_frames[1:], loop=0,
+                    duration=durations[:n], optimize=False,
+                )
+
             self.progress.emit(100)
             self.finished.emit(p["output_path"])
-        except Exception as e:
+        except Exception:
             import traceback
             self.error.emit(traceback.format_exc())
 
@@ -563,6 +598,31 @@ def spn(lo, hi, val, suffix=""):
     return s
 
 
+def cmb(items, current=None):
+    """Themed QComboBox."""
+    c = QComboBox()
+    c.addItems(items)
+    if current and current in items:
+        c.setCurrentText(current)
+    c.setMinimumHeight(32)
+    c.setStyleSheet(f"""
+        QComboBox {{
+            background:{C['input_bg']}; color:{C['text']};
+            border:1px solid {C['border']}; border-radius:7px;
+            padding:5px 10px; font-size:12px;
+        }}
+        QComboBox::drop-down {{ border:none; width:24px; }}
+        QComboBox QAbstractItemView {{
+            background:{C['card']}; color:{C['text']};
+            selection-background-color:{C['accent']};
+            border:1px solid {C['border']};
+        }}
+        QComboBox:hover {{ border-color:{C['border_hi']}; }}
+        QComboBox:focus {{ border-color:{C['accent']}; }}
+    """)
+    return c
+
+
 def section(title):
     g = QGroupBox(title)
     g.setStyleSheet(f"""
@@ -584,6 +644,21 @@ def divider():
     f.setFrameShape(QFrame.HLine)
     f.setStyleSheet(f"background:{C['border']}; border:none; max-height:1px;")
     return f
+
+
+def color_swatch(hex_val="#ffffff"):
+    """Small coloured square button that opens a QColorDialog when clicked."""
+    b = QPushButton()
+    b.setFixedSize(32, 32)
+    b.setToolTip("Pick colour")
+    b.setStyleSheet(f"""
+        QPushButton {{
+            background:{hex_val}; border:1px solid {C['border']};
+            border-radius:6px;
+        }}
+        QPushButton:hover {{ border-color:{C['border_hi']}; }}
+    """)
+    return b
 
 
 # ── Settings Dialog ───────────────────────────────────────────────────────────
@@ -742,9 +817,22 @@ class PreviewPanel(QLabel):
         self.setAlignment(Qt.AlignCenter)
         self.setMinimumSize(380, 380)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self._movie = None  # keep reference alive to prevent GC mid-animation
         self._set_empty()
 
+    def _panel_style(self):
+        return f"""
+            QLabel {{
+                background:{C['panel']}; color:{C['subtext']};
+                border:1px solid {C['border']}; border-radius:11px;
+                padding:6px;
+            }}
+        """
+
     def _set_empty(self):
+        if self._movie:
+            self._movie.stop()
+            self._movie = None
         self.setPixmap(QPixmap())
         self.setText("Preview will appear here")
         self.setStyleSheet(f"""
@@ -756,6 +844,10 @@ class PreviewPanel(QLabel):
         """)
 
     def show_image(self, pil_img):
+        """Display a static PIL image (used for live preview)."""
+        if self._movie:
+            self._movie.stop()
+            self._movie = None
         buf = io.BytesIO()
         pil_img.save(buf, format="PNG")
         buf.seek(0)
@@ -768,18 +860,43 @@ class PreviewPanel(QLabel):
             )
             self.setPixmap(scaled)
             self.setText("")
-            self.setStyleSheet(f"""
-                QLabel {{
-                    background:{C['panel']}; color:{C['subtext']};
-                    border:1px solid {C['border']}; border-radius:11px;
-                    padding:6px;
-                }}
-            """)
+            self.setStyleSheet(self._panel_style())
 
     def show_gif(self, path):
+        """Display an animated GIF using QMovie so all frames play back."""
         try:
-            img = Image.open(path)
-            img = img.convert("RGB")
+            movie = QMovie(path)
+            if not movie.isValid():
+                raise ValueError("QMovie could not load the GIF")
+
+            # Use QImageReader for reliable native-size lookup without needing
+            # to start the movie first (jumpToFrame can fail on some systems)
+            reader = QImageReader(path)
+            native = reader.size()
+            if native.isValid() and not native.isEmpty():
+                scaled_size = native.scaled(
+                    self.width() - 16, self.height() - 16,
+                    Qt.KeepAspectRatio
+                )
+                movie.setScaledSize(scaled_size)
+
+            self._movie = movie
+            self.setMovie(self._movie)
+            self._movie.start()
+            self.setText("")
+            self.setStyleSheet(self._panel_style())
+        except Exception:
+            # Fall back to showing only the first frame as a static image
+            try:
+                img = Image.open(path).convert("RGB")
+                self.show_image(img)
+            except Exception:
+                pass
+
+    def show_webp(self, path):
+        """Display the first frame of a WebP file as a static image."""
+        try:
+            img = Image.open(path).convert("RGB")
             self.show_image(img)
         except Exception:
             pass
@@ -830,32 +947,130 @@ class MainWindow(QMainWindow):
             QToolTip {{ background:{C['card']}; color:{C['text']}; border:1px solid {C['border']}; padding:4px 8px; border-radius:6px; font-size:11px; }}
         """)
 
+    # ── Theme change ──────────────────────────────────────────────────────────
+
     def _change_theme(self, theme_name):
         global C
         self._current_theme = theme_name
         C.update(THEMES[theme_name])
-        # Rebuild UI with new theme
-        old_input = self._input_path
-        old_top = getattr(self, "top_input", None)
-        old_bot = getattr(self, "bot_input", None)
-        top_text = old_top.text() if old_top else ""
-        bot_text = old_bot.text() if old_bot else ""
 
-        # Remove old central widget and rebuild
+        # Snapshot all current UI values so they survive the widget rebuild
+        state = self._snapshot_ui_state()
+
         self._build_ui()
         self._apply_global_style()
-        if top_text and hasattr(self, "top_input"):
-            self.top_input.setText(top_text)
-        if bot_text and hasattr(self, "bot_input"):
-            self.bot_input.setText(bot_text)
-        if old_input:
-            self._input_path = old_input
-            self._on_file_dropped(old_input, skip_preview=False)
+
+        # Restore everything without triggering cascading updates
+        self._restore_ui_state(state)
+
+        # Re-trigger file load if one was already open
+        if state["input_path"]:
+            self._on_file_dropped(state["input_path"], skip_preview=False)
+
+    def _snapshot_ui_state(self):
+        """Capture all user-configurable widget values into a plain dict."""
+        def _get(attr, default):
+            w = getattr(self, attr, None)
+            if w is None:               return default
+            if isinstance(w, QLineEdit): return w.text()
+            if isinstance(w, QCheckBox): return w.isChecked()
+            if isinstance(w, QSpinBox):  return w.value()
+            if isinstance(w, QSlider):   return w.value()
+            if isinstance(w, QComboBox): return w.currentText()
+            return default
+
+        return {
+            "input_path":    self._input_path,
+            "top_text":      _get("top_input",          ""),
+            "bot_text":      _get("bot_input",          ""),
+            "no_caption":    _get("no_caption_check",   False),
+            "font_size":     _get("font_size_spin",     52),
+            "padding":       _get("padding_spin",       18),
+            "outline_thick": _get("outline_thick_spin", 2),
+            "uppercase":     _get("uppercase_check",    True),
+            "outline":       _get("outline_check",      True),
+            "auto_size":     _get("auto_size_check",    False),
+            "align":         _get("align_combo",        "Center"),
+            "bg_color":      _get("bg_color_inp",       "#ffffff"),
+            "text_color":    _get("text_color_inp",     "#000000"),
+            "font_path":     _get("font_input",         ""),
+            "compress":      _get("compress_slider",    100),
+            "max_frames":    _get("max_frames_spin",    60),
+            "out_format":    _get("format_combo",       "GIF"),
+            "out_name":      _get("out_name_input",     ""),
+        }
+
+    def _restore_ui_state(self, s):
+        """Restore widget values from a snapshot dict (signals blocked throughout)."""
+
+        # Numeric / text widgets
+        for attr, value in [
+            ("top_input",          s["top_text"]),
+            ("bot_input",          s["bot_text"]),
+            ("font_size_spin",     s["font_size"]),
+            ("padding_spin",       s["padding"]),
+            ("outline_thick_spin", s["outline_thick"]),
+            ("compress_slider",    s["compress"]),
+            ("max_frames_spin",    s["max_frames"]),
+        ]:
+            w = getattr(self, attr, None)
+            if w:
+                w.blockSignals(True)
+                (w.setText if isinstance(w, QLineEdit) else w.setValue)(value)
+                w.blockSignals(False)
+
+        # Checkboxes
+        for attr, value in [
+            ("uppercase_check",  s["uppercase"]),
+            ("outline_check",    s["outline"]),
+            ("auto_size_check",  s["auto_size"]),
+            ("no_caption_check", s["no_caption"]),
+        ]:
+            w = getattr(self, attr, None)
+            if w:
+                w.blockSignals(True)
+                w.setChecked(value)
+                w.blockSignals(False)
+
+        # Combo boxes
+        for attr, value in [
+            ("align_combo",  s["align"]),
+            ("format_combo", s["out_format"]),
+        ]:
+            w = getattr(self, attr, None)
+            if w:
+                w.blockSignals(True)
+                w.setCurrentText(value)
+                w.blockSignals(False)
+
+        # Plain text inputs
+        for attr, value in [
+            ("bg_color_inp",   s["bg_color"]),
+            ("text_color_inp", s["text_color"]),
+            ("font_input",     s["font_path"]),
+            ("out_name_input", s["out_name"]),
+        ]:
+            w = getattr(self, attr, None)
+            if w:
+                w.blockSignals(True)
+                w.setText(value)
+                w.blockSignals(False)
+
+        # Re-sync swatch colours and derived UI states manually
+        self._sync_swatch(self.bg_swatch,   s["bg_color"])
+        self._sync_swatch(self.text_swatch, s["text_color"])
+        self._toggle_auto_size(s["auto_size"])
+        self._on_no_caption_toggle(s["no_caption"])
+        self._on_format_changed(s["out_format"])  # keeps gen_btn label in sync
+
+        self._input_path = s["input_path"]
 
     def _open_settings(self):
         dlg = SettingsDialog(self, self._current_theme)
         dlg.theme_changed.connect(self._change_theme)
         dlg.exec()
+
+    # ── UI build ──────────────────────────────────────────────────────────────
 
     def _build_ui(self):
         root = QWidget()
@@ -923,7 +1138,7 @@ class MainWindow(QMainWindow):
         # ── Left panel ────────────────────────────────────────────────────────
         left_wrap = QWidget()
         left_wrap.setMinimumWidth(360)
-        left_wrap.setMaximumWidth(460)
+        left_wrap.setMaximumWidth(480)
         left_wrap.setStyleSheet(f"background:{C['bg']};")
         left_wrap_lay = QVBoxLayout(left_wrap)
         left_wrap_lay.setContentsMargins(0, 0, 0, 0)
@@ -995,6 +1210,7 @@ class MainWindow(QMainWindow):
         style_lay = QVBoxLayout(style_sec)
         style_lay.setSpacing(8)
 
+        # Font size + Padding
         row1 = QHBoxLayout()
         fs_col = QVBoxLayout()
         fs_col.setSpacing(3)
@@ -1022,6 +1238,7 @@ class MainWindow(QMainWindow):
 
         style_lay.addWidget(divider())
 
+        # Uppercase + Outline toggles
         row2 = QHBoxLayout()
         self.uppercase_check = chk("UPPERCASE")
         self.uppercase_check.setChecked(True)
@@ -1034,30 +1251,77 @@ class MainWindow(QMainWindow):
         row2.addStretch()
         style_lay.addLayout(row2)
 
+        # Outline thickness + Text alignment (same row)
+        thick_align_row = QHBoxLayout()
+
+        thick_col = QVBoxLayout()
+        thick_col.setSpacing(3)
+        thick_col.addWidget(lbl("Outline thickness", 9, color=C["subtext"]))
+        self.outline_thick_spin = spn(1, 10, 2, " px")
+        self.outline_thick_spin.setToolTip("Stroke width around each character")
+        self.outline_thick_spin.valueChanged.connect(self._update_preview)
+        thick_col.addWidget(self.outline_thick_spin)
+        thick_align_row.addLayout(thick_col)
+
+        thick_align_row.addSpacing(8)
+
+        align_col = QVBoxLayout()
+        align_col.setSpacing(3)
+        align_col.addWidget(lbl("Alignment", 9, color=C["subtext"]))
+        self.align_combo = cmb(["Left", "Center", "Right"], current="Center")
+        self.align_combo.setToolTip("Horizontal alignment of caption text")
+        self.align_combo.currentTextChanged.connect(self._update_preview)
+        align_col.addWidget(self.align_combo)
+        thick_align_row.addLayout(align_col)
+
+        thick_align_row.addStretch()
+        style_lay.addLayout(thick_align_row)
+
         style_lay.addWidget(divider())
 
+        # Colours — hex input paired with a colour-swatch picker button
         color_row = QHBoxLayout()
+
         bg_col = QVBoxLayout()
         bg_col.setSpacing(3)
         bg_col.addWidget(lbl("Caption BG", 9, color=C["subtext"]))
+        bg_inp_row = QHBoxLayout()
+        bg_inp_row.setSpacing(4)
         self.bg_color_inp = inp("#ffffff")
-        self.bg_color_inp.setMaximumWidth(100)
-        self.bg_color_inp.textChanged.connect(self._update_preview)
-        bg_col.addWidget(self.bg_color_inp)
+        self.bg_color_inp.setMaximumWidth(84)
+        self.bg_swatch = color_swatch("#ffffff")
+        bg_inp_row.addWidget(self.bg_color_inp)
+        bg_inp_row.addWidget(self.bg_swatch)
+        bg_col.addLayout(bg_inp_row)
         color_row.addLayout(bg_col)
+
         color_row.addSpacing(8)
+
         tc_col = QVBoxLayout()
         tc_col.setSpacing(3)
         tc_col.addWidget(lbl("Text color", 9, color=C["subtext"]))
+        tc_inp_row = QHBoxLayout()
+        tc_inp_row.setSpacing(4)
         self.text_color_inp = inp("#000000")
-        self.text_color_inp.setMaximumWidth(100)
-        self.text_color_inp.textChanged.connect(self._update_preview)
-        tc_col.addWidget(self.text_color_inp)
+        self.text_color_inp.setMaximumWidth(84)
+        self.text_swatch = color_swatch("#000000")
+        tc_inp_row.addWidget(self.text_color_inp)
+        tc_inp_row.addWidget(self.text_swatch)
+        tc_col.addLayout(tc_inp_row)
         color_row.addLayout(tc_col)
+
         color_row.addStretch()
         style_lay.addLayout(color_row)
 
+        # Wire swatch ↔ text input bidirectionally; then hook preview update
+        self._wire_color_swatch(self.bg_swatch,   self.bg_color_inp)
+        self._wire_color_swatch(self.text_swatch, self.text_color_inp)
+        self.bg_color_inp.textChanged.connect(self._update_preview)
+        self.text_color_inp.textChanged.connect(self._update_preview)
+
         style_lay.addWidget(divider())
+
+        # Custom font
         style_lay.addWidget(lbl("Custom font (.ttf / .otf)", 9, color=C["subtext"]))
         font_row = QHBoxLayout()
         self.font_input = inp("Auto-detect Impact")
@@ -1100,6 +1364,18 @@ class MainWindow(QMainWindow):
         self.compress_slider.valueChanged.connect(self._on_compress_changed)
         compress_lay.addWidget(self.compress_slider)
 
+        # Max frames — quality vs. file-size knob for video input
+        frames_col = QVBoxLayout()
+        frames_col.setSpacing(3)
+        frames_col.addWidget(lbl("Max frames (video)", 9, color=C["subtext"]))
+        self.max_frames_spin = spn(5, 300, 60, " fr")
+        self.max_frames_spin.setToolTip(
+            "Maximum frames extracted from a video.\n"
+            "Lower → smaller file  ·  Higher → smoother motion."
+        )
+        frames_col.addWidget(self.max_frames_spin)
+        compress_lay.addLayout(frames_col)
+
         # Estimated size display
         size_row = QHBoxLayout()
         size_row.addWidget(lbl("Est. output size:", 10, color=C["subtext"]))
@@ -1113,6 +1389,17 @@ class MainWindow(QMainWindow):
         out_sec = section("OUTPUT")
         out_lay = QVBoxLayout(out_sec)
         out_lay.setSpacing(6)
+
+        # Format selector — GIF for compatibility, WebP for smaller files
+        fmt_col = QVBoxLayout()
+        fmt_col.setSpacing(3)
+        fmt_col.addWidget(lbl("Format", 9, color=C["subtext"]))
+        self.format_combo = cmb(["GIF", "WebP"], current="GIF")
+        self.format_combo.setToolTip("GIF  — universal  ·  WebP  — smaller file, better quality")
+        self.format_combo.currentTextChanged.connect(self._on_format_changed)
+        fmt_col.addWidget(self.format_combo)
+        out_lay.addLayout(fmt_col)
+
         out_lay.addWidget(lbl("Filename (blank = auto)", 9, color=C["subtext"]))
         self.out_name_input = inp("my_caption.gif")
         out_lay.addWidget(self.out_name_input)
@@ -1155,7 +1442,7 @@ class MainWindow(QMainWindow):
         self.status_lbl.setWordWrap(True)
         lay.addWidget(self.status_lbl)
 
-        self.copy_btn = btn("📋  Copy GIF to Clipboard")
+        self.copy_btn = btn("📋  Copy to Clipboard")
         self.copy_btn.setVisible(False)
         self.copy_btn.clicked.connect(self._copy_to_clipboard)
         lay.addWidget(self.copy_btn)
@@ -1182,6 +1469,42 @@ class MainWindow(QMainWindow):
         splitter.addWidget(right_wrap)
         splitter.setSizes([400, 700])
 
+    # ── Colour swatch helpers ─────────────────────────────────────────────────
+
+    def _sync_swatch(self, swatch, hex_val):
+        """Update a swatch button's background colour to match hex_val."""
+        try:
+            v = hex_val.strip()
+            if len(v) in (4, 7) and v.startswith("#"):
+                QColor(v)  # validate
+                swatch.setStyleSheet(f"""
+                    QPushButton {{
+                        background:{v}; border:1px solid {C['border']};
+                        border-radius:6px;
+                    }}
+                    QPushButton:hover {{ border-color:{C['border_hi']}; }}
+                """)
+        except Exception:
+            pass
+
+    def _wire_color_swatch(self, swatch, line_edit):
+        """Connect a colour swatch and its paired QLineEdit bidirectionally.
+
+        Clicking the swatch opens QColorDialog and pushes the result into
+        line_edit; typing in line_edit immediately repaints the swatch.
+        """
+        def _on_swatch_click():
+            current = line_edit.text().strip() or "#ffffff"
+            color = QColorDialog.getColor(QColor(current), self, "Pick colour")
+            if color.isValid():
+                line_edit.setText(color.name())   # triggers textChanged → _sync_swatch
+
+        def _on_text_changed(text):
+            self._sync_swatch(swatch, text)
+
+        swatch.clicked.connect(_on_swatch_click)
+        line_edit.textChanged.connect(_on_text_changed)
+
     # ── No Caption toggle ─────────────────────────────────────────────────────
 
     def _on_no_caption_toggle(self, state):
@@ -1189,6 +1512,14 @@ class MainWindow(QMainWindow):
         self.top_input.setEnabled(enabled)
         self.bot_input.setEnabled(enabled)
         self._update_preview()
+
+    # ── Format changed ────────────────────────────────────────────────────────
+
+    def _on_format_changed(self, fmt):
+        """Sync the generate button label and filename placeholder to the chosen format."""
+        ext = "webp" if fmt == "WebP" else "gif"
+        self.gen_btn.setText(f"▶  Generate {fmt}")
+        self.out_name_input.setPlaceholderText(f"my_caption.{ext}")
 
     # ── Compression slider ────────────────────────────────────────────────────
 
@@ -1245,7 +1576,7 @@ class MainWindow(QMainWindow):
         self._is_video = ext in self.VIDEO_EXTS
 
         if self._is_video:
-            # Check ffmpeg is available
+            # Check ffmpeg is available before accepting the file
             try:
                 get_ffmpeg()
             except RuntimeError:
@@ -1254,7 +1585,7 @@ class MainWindow(QMainWindow):
                     "ffmpeg was not found.\n\n"
                     "Option 1 (easiest): pip install imageio-ffmpeg\n"
                     "Option 2: download from https://www.gyan.dev/ffmpeg/builds/\n"
-                    "  and place ffmpeg.exe next to GomorronCaptionMaker.exe"
+                    "  and place ffmpeg next to GomorronCaptionMaker."
                 )
                 self._input_path = ""
                 self._is_video = False
@@ -1293,15 +1624,11 @@ class MainWindow(QMainWindow):
         mime = cb.mimeData()
         if mime.hasImage():
             qimg = cb.image()
-            buf = QByteArray()
-            buf_io = io.BytesIO()
             qimg = qimg.convertToFormat(QImage.Format_RGBA8888)
             width, height = qimg.width(), qimg.height()
-            ptr = qimg.bits()
-            arr = bytes(ptr)
+            arr = bytes(qimg.bits())
             pil = Image.frombytes("RGBA", (width, height), arr)
             self._pasted_img = pil.convert("RGB")
-            self._input_path = ""
             self._is_video = False
             tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
             self._pasted_img.save(tmp.name)
@@ -1351,10 +1678,15 @@ class MainWindow(QMainWindow):
             bg_c  = safe_hex(self.bg_color_inp.text(),   "#ffffff")
             txt_c = safe_hex(self.text_color_inp.text(), "#000000")
 
-            kw = dict(font_size=fs, padding=pad, font_path=font_path,
-                      is_impact=is_impact, outline=self.outline_check.isChecked(),
-                      outline_thickness=2, uppercase=self.uppercase_check.isChecked(),
-                      bg_color=bg_c, text_color=txt_c)
+            kw = dict(
+                font_size=fs, padding=pad,
+                font_path=font_path, is_impact=is_impact,
+                outline=self.outline_check.isChecked(),
+                outline_thickness=self.outline_thick_spin.value(),
+                uppercase=self.uppercase_check.isChecked(),
+                align=self.align_combo.currentText().lower(),
+                bg_color=bg_c, text_color=txt_c,
+            )
 
             if no_caption:
                 preview_img = src
@@ -1365,10 +1697,11 @@ class MainWindow(QMainWindow):
                 if top_box: parts.append(top_box)
                 parts.append(src)
                 if bot_box: parts.append(bot_box)
-                preview_img = composite_parts(parts)
+                preview_img = composite_parts(parts, bg_color=bg_c)
             self.preview.show_image(preview_img)
         except Exception:
-            pass
+            import traceback
+            traceback.print_exc()  # surface errors to console — never silently dropped
 
     # ── Style toggles ─────────────────────────────────────────────────────────
 
@@ -1394,13 +1727,16 @@ class MainWindow(QMainWindow):
             self._flash_status("Enter at least one caption (or enable No Caption).", error=True)
             return
 
+        out_fmt = self.format_combo.currentText()          # "GIF" or "WebP"
+        ext     = ".webp" if out_fmt == "WebP" else ".gif"
+
         out_name = self.out_name_input.text().strip()
         if out_name:
-            if not out_name.lower().endswith(".gif"):
-                out_name += ".gif"
+            # Strip any existing extension, then reapply the correct one
+            out_name = Path(out_name).stem + ext
         else:
-            stem = Path(self._input_path).stem
-            out_name = f"{stem}_caption.gif"
+            stem     = Path(self._input_path).stem
+            out_name = f"{stem}_caption{ext}"
         out_path = str(OUTPUT_DIR / out_name)
 
         def safe_hex(v, fallback):
@@ -1422,13 +1758,16 @@ class MainWindow(QMainWindow):
             padding           = self.padding_spin.value(),
             font_custom       = self.font_input.text().strip() or None,
             outline           = self.outline_check.isChecked(),
-            outline_thickness = 2,
+            outline_thickness = self.outline_thick_spin.value(),
             uppercase         = self.uppercase_check.isChecked(),
-            bg_color          = safe_hex(self.bg_color_inp.text(), "#ffffff"),
+            align             = self.align_combo.currentText().lower(),
+            bg_color          = safe_hex(self.bg_color_inp.text(),   "#ffffff"),
             text_color        = safe_hex(self.text_color_inp.text(), "#000000"),
             no_caption        = no_caption,
             is_video          = self._is_video,
             compress_pct      = self.compress_slider.value(),
+            max_frames        = self.max_frames_spin.value(),
+            out_format        = out_fmt,
         )
 
         self.gen_btn.setEnabled(False)
@@ -1456,7 +1795,13 @@ class MainWindow(QMainWindow):
         size = os.path.getsize(path)
         self._set_status(f"Saved → outputs/{stem}  ({format_size(size)})", color=C["success"])
         self.copy_btn.setVisible(True)
-        self.preview.show_gif(path)
+
+        # Show animated playback for GIF; static first-frame for WebP
+        if path.endswith(".webp"):
+            self.preview.show_webp(path)
+        else:
+            self.preview.show_gif(path)
+
         # Update actual file size
         self.est_size_lbl.setText(format_size(size) + " (actual)")
         QTimer.singleShot(3000, lambda: self.progress.setVisible(False))
@@ -1474,14 +1819,16 @@ class MainWindow(QMainWindow):
             return
         try:
             with open(self._last_output, "rb") as f:
-                gif_bytes = f.read()
+                data_bytes = f.read()
             from PySide6.QtCore import QMimeData, QUrl
+            # Use the correct MIME type for the output format
+            mime_type = "image/webp" if self._last_output.endswith(".webp") else "image/gif"
             mdata = QMimeData()
-            mdata.setData("image/gif", QByteArray(gif_bytes))
+            mdata.setData(mime_type, QByteArray(data_bytes))
             url = QUrl.fromLocalFile(self._last_output)
             mdata.setUrls([url])
             QApplication.clipboard().setMimeData(mdata)
-            self._set_status("GIF copied to clipboard.", color=C["success"])
+            self._set_status("Copied to clipboard.", color=C["success"])
         except Exception as e:
             self._set_status(f"Copy failed: {e}", error=True)
 
